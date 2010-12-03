@@ -797,24 +797,21 @@ public class NAKACK extends Protocol implements Retransmitter.RetransmitCommand,
         final AtomicBoolean added=new AtomicBoolean();
         List<Message> msgs=null;
 
-        if(loopback)
+        if(loopback) {
             added.set(true);
-        else {
-            msgs=win.addAndRemove(hdr.seqno, msg, added, false, max_msg_batch_size);
+            msgs=win.removeMany(win.getProcessing(), false, max_msg_batch_size);
         }
+        else
+            msgs=win.addAndRemove(hdr.seqno, msg, added, false, max_msg_batch_size);
         
         // OOB msg is passed up. When removed, we discard it. Affects ordering: http://jira.jboss.com/jira/browse/JGRP-379
         if(added.get() && msg.isFlagSet(Message.OOB)) {
             if(loopback)
                 msg=win.get(hdr.seqno); // we *have* to get a message, because loopback means we didn't add it to win !
-            if(msg != null && msg.isFlagSet(Message.OOB)) {
-                if(msg.setTransientFlagIfAbsent(Message.OOB_DELIVERED))
-                    up_prot.up(new Event(Event.MSG, msg));
-            }
+            if(msg != null && msg.isFlagSet(Message.OOB) && msg.setTransientFlagIfAbsent(Message.OOB_DELIVERED))
+                up_prot.up(new Event(Event.MSG, msg));
         }
 
-        if(loopback)
-            msgs=win.removeMany(win.getProcessing(), false, max_msg_batch_size);
         if(msgs == null)
             return;
 
@@ -823,8 +820,6 @@ public class NAKACK extends Protocol implements Retransmitter.RetransmitCommand,
                 // discard OOB msg if it has already been delivered (http://jira.jboss.com/jira/browse/JGRP-379)
                 if(msg_to_deliver.isFlagSet(Message.OOB) && !msg_to_deliver.setTransientFlagIfAbsent(Message.OOB_DELIVERED))
                     continue;
-
-                //msg_to_deliver.removeHeader(getName()); // Changed by bela Jan 29 2003: not needed (see above)
                 try {
                     up_prot.up(new Event(Event.MSG, msg_to_deliver));
                 }
