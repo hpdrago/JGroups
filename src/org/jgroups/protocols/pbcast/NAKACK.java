@@ -794,10 +794,17 @@ public class NAKACK extends Protocol implements Retransmitter.RetransmitCommand,
         }
 
         boolean loopback=local_addr.equals(sender);
-        boolean added=loopback || win.add(hdr.seqno, msg);
+        final AtomicBoolean added=new AtomicBoolean();
+        List<Message> msgs=null;
 
+        if(loopback)
+            added.set(true);
+        else {
+            msgs=win.addAndRemove(hdr.seqno, msg, added, false, max_msg_batch_size);
+        }
+        
         // OOB msg is passed up. When removed, we discard it. Affects ordering: http://jira.jboss.com/jira/browse/JGRP-379
-        if(added && msg.isFlagSet(Message.OOB)) {
+        if(added.get() && msg.isFlagSet(Message.OOB)) {
             if(loopback)
                 msg=win.get(hdr.seqno); // we *have* to get a message, because loopback means we didn't add it to win !
             if(msg != null && msg.isFlagSet(Message.OOB)) {
@@ -806,45 +813,28 @@ public class NAKACK extends Protocol implements Retransmitter.RetransmitCommand,
             }
         }
 
-        // Efficient way of checking whether another thread is already processing messages from 'sender'.
-        // If that's the case, we return immediately and let the existing thread process our message
-        // (https://jira.jboss.org/jira/browse/JGRP-829). Benefit: fewer threads blocked on the same lock, these threads
-        // can be returned to the thread pool
-        final AtomicBoolean processing=win.getProcessing();
-        if(!processing.compareAndSet(false, true)) {
+        if(loopback)
+            msgs=win.removeMany(win.getProcessing(), false, max_msg_batch_size);
+        if(msgs == null)
             return;
-        }
 
-        boolean released_processing=false;
         try {
-            while(true) {
-                // we're removing a msg and set processing to false (if null) *atomically* (wrt to add())
-                List<Message> msgs=win.removeMany(processing, max_msg_batch_size);
-                if(msgs == null || msgs.isEmpty()) {
-                    released_processing=true;
-                    return;
+            for(final Message msg_to_deliver: msgs) {
+                // discard OOB msg if it has already been delivered (http://jira.jboss.com/jira/browse/JGRP-379)
+                if(msg_to_deliver.isFlagSet(Message.OOB) && !msg_to_deliver.setTransientFlagIfAbsent(Message.OOB_DELIVERED))
+                    continue;
+
+                //msg_to_deliver.removeHeader(getName()); // Changed by bela Jan 29 2003: not needed (see above)
+                try {
+                    up_prot.up(new Event(Event.MSG, msg_to_deliver));
                 }
-
-                for(final Message msg_to_deliver: msgs) {
-                    // discard OOB msg if it has already been delivered (http://jira.jboss.com/jira/browse/JGRP-379)
-                    if(msg_to_deliver.isFlagSet(Message.OOB) && !msg_to_deliver.setTransientFlagIfAbsent(Message.OOB_DELIVERED))
-                        continue;
-
-                    //msg_to_deliver.removeHeader(getName()); // Changed by bela Jan 29 2003: not needed (see above)
-                    try {
-                        up_prot.up(new Event(Event.MSG, msg_to_deliver));
-                    }
-                    catch(Throwable t) {
-                        log.error("couldn't deliver message " + msg_to_deliver, t);
-                    }
+                catch(Throwable t) {
+                    log.error("couldn't deliver message " + msg_to_deliver, t);
                 }
             }
         }
         finally {
-            // processing is always set in win.remove(processing) above and never here ! This code is just a
-            // 2nd line of defense should there be an exception before win.remove(processing) sets processing
-            if(!released_processing)
-                processing.set(false);
+            win.getProcessing().set(false);
         }
     }
 

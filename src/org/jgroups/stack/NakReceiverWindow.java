@@ -219,30 +219,20 @@ public class NakReceiverWindow {
     }
 
 
-    /**
-     * Adds a message according to its seqno (sequence number).
-     * <p>
-     * There are 4 cases where messages are added:
-     * <ol>
-     * <li>seqno is the next to be expected seqno: added to map
-     * <li>seqno is <= highest_delivered: discard as we've already delivered it
-     * <li>seqno is smaller than the next expected seqno: missing message, add it
-     * <li>seqno is greater than the next expected seqno: add it to map and fill the gaps with null messages
-     *     for retransmission. Add the seqno to the retransmitter too
-     * </ol>
-     * @return True if the message was added successfully, false otherwise (e.g. duplicate message)
-     */
-    public boolean add(final long seqno, final Message msg) {
+
+
+
+    protected boolean _add(final long seqno, final Message msg) {
         long old_next, next_to_add;
         int num_xmits=0;
 
-        lock.writeLock().lock();
         try {
             if(!running)
                 return false;
 
             next_to_add=highest_received +1;
             old_next=next_to_add;
+
 
             // Case #1: we received the expected seqno: most common path
             if(seqno == next_to_add) {
@@ -281,7 +271,6 @@ public class NakReceiverWindow {
         }
         finally {
             highest_received=Math.max(highest_received, seqno);
-            lock.writeLock().unlock();
         }
 
         if(listener != null && num_xmits > 0) {
@@ -289,6 +278,30 @@ public class NakReceiverWindow {
         }
 
         return true;
+    }
+
+
+    /**
+     * Adds a message according to its seqno (sequence number).
+     * <p>
+     * There are 4 cases where messages are added:
+     * <ol>
+     * <li>seqno is the next to be expected seqno: added to map
+     * <li>seqno is <= highest_delivered: discard as we've already delivered it
+     * <li>seqno is smaller than the next expected seqno: missing message, add it
+     * <li>seqno is greater than the next expected seqno: add it to map and fill the gaps with null messages
+     *     for retransmission. Add the seqno to the retransmitter too
+     * </ol>
+     * @return True if the message was added successfully, false otherwise (e.g. duplicate message)
+     */
+    public boolean add(final long seqno, Message msg) {
+        lock.writeLock().lock();
+        try {
+            return _add(seqno, msg);
+        }
+        finally {
+            lock.writeLock().unlock();
+        }
     }
 
 
@@ -339,47 +352,79 @@ public class NakReceiverWindow {
         return removeMany(processing, false, max_results);
     }
 
+
+    protected List<Message> _removeMany(final AtomicBoolean processing, boolean discard_own_msgs, int max_results) {
+        List<Message> retval=null;
+        int num_results=0;
+
+        while(true) {
+            long next_to_remove=highest_delivered +1;
+            Message msg=xmit_table.get(next_to_remove);
+
+            if(msg != null) { // message exists and is ready for delivery
+                if(discard_delivered_msgs) {
+                    Address sender=msg.getSrc();
+                    if(discard_own_msgs || !local_addr.equals(sender)) { // don't remove if we sent the message !
+                        xmit_table.remove(next_to_remove);
+                    }
+                }
+                highest_delivered=next_to_remove;
+                if(retval == null)
+                    retval=new LinkedList<Message>();
+                retval.add(msg);
+                if(max_results <= 0 || ++num_results < max_results)
+                    continue;
+            }
+
+            if((retval == null || retval.isEmpty()) && processing != null)
+                processing.set(false);
+            return retval;
+        }
+    }
+
     /**
      * Removes as many messages as possible
-     * @param discard_own_msgs Removes messages from xmit_table even if we sent it
+     * @param discard_own_msgs Removes messages from xmit_table even if we sent it. This is only needed by UNICAST2
      * @param max_results Max number of messages to remove in one batch
      * @return List<Message> A list of messages, or null if no available messages were found
      */
     public List<Message> removeMany(final AtomicBoolean processing, boolean discard_own_msgs, int max_results) {
-        List<Message> retval=null;
-        int num_results=0;
-
         lock.writeLock().lock();
         try {
-            while(true) {
-                long next_to_remove=highest_delivered +1;
-                Message msg=xmit_table.get(next_to_remove);
-
-                if(msg != null) { // message exists and is ready for delivery
-                    if(discard_delivered_msgs) {
-                        Address sender=msg.getSrc();
-                        if(discard_own_msgs || !local_addr.equals(sender)) { // don't remove if we sent the message !
-                            xmit_table.remove(next_to_remove);
-                        }
-                    }
-                    highest_delivered=next_to_remove;
-                    if(retval == null)
-                        retval=new LinkedList<Message>();
-                    retval.add(msg);
-                    if(max_results <= 0 || ++num_results < max_results)
-                        continue;
-                }
-
-                if((retval == null || retval.isEmpty()) && processing != null)
-                    processing.set(false);
-                return retval;
-            }
+            return _removeMany(processing, discard_own_msgs, max_results);
         }
         finally {
             lock.writeLock().unlock();
         }
     }
 
+
+    /**
+     * Adds a message and removes as many messages as possible. If the message was added successfully, added will be
+     * true, otherwise false. When this method return a non-null list, the value of 'processing' is guaranteed to be
+     * set to true, therefore the caller has to set it back to false once it is done with passing the messages from
+     * the return value up the stack !
+     * @param seqno
+     * @param msg
+     * @param added
+     * @param discard_own_msgs
+     * @param max_results
+     * @return A list of messages, or null if no message could be removed. If non-null, processing will be true, and it
+     * is the caller's responsibility to set it back to true once all messages have been processed !
+     */
+    public List<Message> addAndRemove(long seqno, Message msg, final AtomicBoolean added,
+                                      boolean discard_own_msgs, int max_results) {
+        lock.writeLock().lock();
+        try {
+            added.set(_add(seqno, msg));
+            if(!processing.compareAndSet(false, true))
+                return null;
+            return _removeMany(processing, discard_own_msgs, max_results);
+        }
+        finally {
+            lock.writeLock().unlock();
+        }
+    }
 
 
     /**
