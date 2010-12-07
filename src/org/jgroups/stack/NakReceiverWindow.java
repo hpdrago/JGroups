@@ -8,12 +8,16 @@ import org.jgroups.Message;
 import org.jgroups.annotations.GuardedBy;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
+import org.jgroups.util.ConcurrentLinkedBlockingQueue;
 import org.jgroups.util.TimeScheduler;
+import org.jgroups.util.Tuple;
 import org.jgroups.util.Util;
 
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -73,6 +77,10 @@ public class NakReceiverWindow {
     @GuardedBy("lock")
     private long highest_received=0;
 
+    /** All message are added to this queue first. One thread will then remove messages from the waiting area and
+     * add them to the xmit_table. Then removeMany() will remove messages from xmit_table.
+     */
+    protected final Queue<Tuple<Long,Message>> waiting_area=new ConcurrentLinkedQueue<Tuple<Long,Message>>();
 
     /**
      * ConcurrentMap<Long,Message>. Maintains messages keyed by (sorted) sequence numbers
@@ -233,14 +241,29 @@ public class NakReceiverWindow {
      * @return True if the message was added successfully, false otherwise (e.g. duplicate message)
      */
     public boolean add(final long seqno, final Message msg) {
+        if(msg.isFlagSet(Message.OOB)) {
+            lock.writeLock().lock();
+            try {
+                return _add(seqno, msg);
+            }
+            finally {
+                lock.writeLock().unlock();
+            }
+        }
+
+        waiting_area.add(new Tuple<Long,Message>(seqno,msg));
+        return true;
+    }
+
+
+    public boolean _add(final long seqno, final Message msg) {
         long old_next, next_to_add;
         int num_xmits=0;
 
-        lock.writeLock().lock();
-        try {
-            if(!running)
-                return false;
+        if(!running)
+            return false;
 
+        try {
             next_to_add=highest_received +1;
             old_next=next_to_add;
 
@@ -258,7 +281,7 @@ public class NakReceiverWindow {
             }
 
             // Case #3: we finally received a missing message. Case #2 handled seqno <= highest_delivered, so this
-            // seqno *must* be between highest_delivered and next_to_add 
+            // seqno *must* be between highest_delivered and next_to_add
             if(seqno < next_to_add) {
                 if(xmit_table.containsKey(seqno))
                     return false; // key/value was present
@@ -281,7 +304,6 @@ public class NakReceiverWindow {
         }
         finally {
             highest_received=Math.max(highest_received, seqno);
-            lock.writeLock().unlock();
         }
 
         if(listener != null && num_xmits > 0) {
@@ -352,6 +374,11 @@ public class NakReceiverWindow {
         lock.writeLock().lock();
         try {
             while(true) {
+                Tuple<Long,Message> tuple;
+                while((tuple=waiting_area.poll()) != null) {
+                    _add(tuple.getVal1(), tuple.getVal2());
+                }
+
                 long next_to_remove=highest_delivered +1;
                 Message msg=xmit_table.get(next_to_remove);
 
