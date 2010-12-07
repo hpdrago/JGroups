@@ -53,6 +53,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class NakReceiverWindow {
 
+    protected static final Message STABLE_MESSAGE=new Message();
+
     public interface Listener {
         void missingMessageReceived(long seqno, Address original_sender);
         void messageGapDetected(long from, long to, Address src);
@@ -376,7 +378,12 @@ public class NakReceiverWindow {
             while(true) {
                 Tuple<Long,Message> tuple;
                 while((tuple=waiting_area.poll()) != null) {
-                    _add(tuple.getVal1(), tuple.getVal2());
+                    long seqno=tuple.getVal1();
+                    Message msg=tuple.getVal2();
+                    if(msg == STABLE_MESSAGE)
+                        _stable(seqno);
+                        else
+                        _add(seqno, msg);
                 }
 
                 long next_to_remove=highest_delivered +1;
@@ -408,37 +415,35 @@ public class NakReceiverWindow {
     }
 
 
+    public void stable(long seqno) {
+        waiting_area.add(new Tuple<Long,Message>(seqno, STABLE_MESSAGE));
+    }
+
 
     /**
      * Delete all messages <= seqno (they are stable, that is, have been received at all members).
      * Stop when a number > seqno is encountered (all messages are ordered on seqnos).
      */
-    public void stable(long seqno) {
-        lock.writeLock().lock();
-        try {
-            if(seqno > highest_delivered) {
-                if(log.isWarnEnabled())
-                    log.warn("seqno " + seqno + " is > highest_delivered (" + highest_delivered + ";) ignoring stability message");
-                return;
-            }
+    public void _stable(long seqno) {
+        if(seqno > highest_delivered) {
+            if(log.isWarnEnabled())
+                log.warn("seqno " + seqno + " is > highest_delivered (" + highest_delivered + ";) ignoring stability message");
+            return;
+        }
 
-            // we need to remove all seqnos *including* seqno
-            if(!xmit_table.isEmpty()) {
-                for(long i=low; i <= seqno; i++) {
-                    xmit_table.remove(i);
-                }
-            }
-            // remove all seqnos below seqno from retransmission
+        // we need to remove all seqnos *including* seqno
+        if(!xmit_table.isEmpty()) {
             for(long i=low; i <= seqno; i++) {
-                retransmitter.remove(i);
+                xmit_table.remove(i);
             }
+        }
+        // remove all seqnos below seqno from retransmission
+        for(long i=low; i <= seqno; i++) {
+            retransmitter.remove(i);
+        }
 
-            highest_stability_seqno=Math.max(highest_stability_seqno, seqno);
-            low=Math.max(low, seqno);
-        }
-        finally {
-            lock.writeLock().unlock();
-        }
+        highest_stability_seqno=Math.max(highest_stability_seqno, seqno);
+        low=Math.max(low, seqno);
     }
 
 
@@ -465,17 +470,7 @@ public class NakReceiverWindow {
 
     /** Returns the lowest, highest delivered and highest received seqnos */
     public long[] getDigest() {
-        lock.readLock().lock();
-        try {
-            long[] retval=new long[3];
-            retval[0]=low;
-            retval[1]=highest_delivered;
-            retval[2]=highest_received;
-            return retval;
-        }
-        finally {
-            lock.readLock().unlock();
-        }
+        return new long[]{low, highest_delivered, highest_received};
     }
 
 
